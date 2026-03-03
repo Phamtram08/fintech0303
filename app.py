@@ -530,7 +530,7 @@ elif data_source == "Upload PDF":
     if st.session_state.pdf_processed and st.session_state.pdf_data:
         data = st.session_state.pdf_data
         
-        # Hiển thị thông báo
+        # Hiển thị thông báo - ĐÃ SỬA
         if data.get('success'):
             st.markdown(f"""
             <div class="success-box">
