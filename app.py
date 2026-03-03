@@ -11,9 +11,22 @@ import time
 import re
 import tempfile
 import os
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
-# Kiểm tra phiên bản Streamlit
+# Kiểm tra thư viện PDF
+try:
+    import pdfplumber
+    PDFPLUMBER_AVAILABLE = True
+except ImportError:
+    PDFPLUMBER_AVAILABLE = False
+
+try:
+    import PyPDF2
+    PYPDF2_AVAILABLE = True
+except ImportError:
+    PYPDF2_AVAILABLE = False
+
+# Cấu hình trang
 st.set_page_config(
     page_title="Tự động hóa báo cáo tài chính",
     page_icon="📊",
@@ -36,6 +49,22 @@ st.markdown("""
         padding: 20px;
         margin: 10px 0;
     }
+    .success-box {
+        padding: 10px;
+        border-radius: 5px;
+        background-color: #d4edda;
+        border: 1px solid #c3e6cb;
+        color: #155724;
+        margin: 10px 0;
+    }
+    .warning-box {
+        padding: 10px;
+        border-radius: 5px;
+        background-color: #fff3cd;
+        border: 1px solid #ffeeba;
+        color: #856404;
+        margin: 10px 0;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -53,6 +82,9 @@ if 'initialized' not in st.session_state:
     st.session_state.df_upload = None
     st.session_state.loading = False
     st.session_state.last_update = None
+    st.session_state.uploaded_pdf = None
+    st.session_state.uploaded_file = None
+    st.session_state.pdf_processed = False
 
 # Sidebar
 with st.sidebar:
@@ -113,18 +145,25 @@ with st.sidebar:
     elif data_source == "Upload PDF":
         st.subheader("📄 Upload file PDF")
         
+        # Kiểm tra thư viện PDF
+        if not PDFPLUMBER_AVAILABLE and not PYPDF2_AVAILABLE:
+            st.error("⚠️ Thiếu thư viện đọc PDF. Vui lòng cài đặt:")
+            st.code("pip install pdfplumber PyPDF2")
+        
         uploaded_pdf = st.file_uploader(
             "Chọn file PDF",
             type=['pdf'],
             accept_multiple_files=False,
-            help="Chọn báo cáo tài chính dạng PDF"
+            help="Chọn báo cáo tài chính dạng PDF (tối đa 200MB)"
         )
         
         if uploaded_pdf:
             st.session_state.uploaded_pdf = uploaded_pdf
+            st.info(f"📄 File: {uploaded_pdf.name} ({uploaded_pdf.size/1024/1024:.1f}MB)")
             
             if st.button("📄 Xử lý PDF", use_container_width=True, type="primary"):
                 st.session_state.loading = True
+                st.session_state.pdf_processed = False
                 st.rerun()
     
     else:  # Upload CSV/Excel
@@ -150,6 +189,8 @@ with st.sidebar:
     with st.expander("ℹ️ Thông tin"):
         st.write(f"**Python:** 3.13")
         st.write(f"**Streamlit:** 1.54.0")
+        st.write(f"**pdfplumber:** {'✅' if PDFPLUMBER_AVAILABLE else '❌'}")
+        st.write(f"**PyPDF2:** {'✅' if PYPDF2_AVAILABLE else '❌'}")
         if st.session_state.last_update:
             st.write(f"**Cập nhật:** {st.session_state.last_update}")
 
@@ -191,14 +232,6 @@ def fetch_yahoo_finance(ticker: str, years: int) -> Dict[str, Any]:
         balance_sheet = stock.balance_sheet
         cashflow = stock.cashflow
         
-        # Thử lấy quarterly nếu annual không có
-        if financials is None or financials.empty:
-            financials = stock.quarterly_financials
-        if balance_sheet is None or balance_sheet.empty:
-            balance_sheet = stock.quarterly_balance_sheet
-        if cashflow is None or cashflow.empty:
-            cashflow = stock.quarterly_cashflow
-        
         return {
             "success": True,
             "ticker": ticker,
@@ -217,12 +250,22 @@ def fetch_yahoo_finance(ticker: str, years: int) -> Dict[str, Any]:
         else:
             return {"success": False, "error": error_msg, "ticker": ticker}
 
-@st.cache_data(ttl=3600)
-def extract_pdf_data(pdf_file) -> Optional[pd.DataFrame]:
-    """Trích xuất dữ liệu từ PDF"""
+@st.cache_data(ttl=3600, show_spinner="🔄 Đang xử lý file PDF...")
+def extract_pdf_data(pdf_file) -> Optional[Dict]:
+    """Trích xuất dữ liệu từ PDF và trả về dạng có cấu trúc"""
     
     if pdf_file is None:
         return None
+    
+    result = {
+        'success': False,
+        'pages': [],
+        'tables': [],
+        'text': [],
+        'financial_data': [],
+        'error': None,
+        'filename': pdf_file.name if pdf_file else 'unknown.pdf'
+    }
     
     try:
         # Tạo file tạm
@@ -230,59 +273,115 @@ def extract_pdf_data(pdf_file) -> Optional[pd.DataFrame]:
             tmp_file.write(pdf_file.getvalue())
             tmp_path = tmp_file.name
         
-        all_tables = []
+        st.info(f"📄 Đang xử lý file: {pdf_file.name}")
         
-        # Đọc PDF
-        try:
-            import pdfplumber
-            with pdfplumber.open(tmp_path) as pdf:
-                for page_num, page in enumerate(pdf.pages):
-                    # Lấy text
-                    text = page.extract_text()
-                    if text:
-                        lines = text.split('\n')
-                        financial_lines = []
-                        
-                        # Tìm dòng có số liệu tài chính
-                        keywords = ['doanh thu', 'lợi nhuận', 'chi phí', 'tài sản',
-                                  'nợ', 'vốn', 'revenue', 'profit', 'asset']
-                        
-                        for line in lines:
-                            if any(k in line.lower() for k in keywords):
-                                if re.search(r'\d+[.,]\d+', line):
-                                    financial_lines.append(line)
-                        
-                        if financial_lines:
-                            all_tables.extend(financial_lines)
+        # Thử đọc bằng pdfplumber trước
+        if PDFPLUMBER_AVAILABLE:
+            try:
+                with pdfplumber.open(tmp_path) as pdf:
+                    result['total_pages'] = len(pdf.pages)
                     
-                    # Lấy bảng
-                    tables = page.extract_tables()
-                    for table in tables:
-                        if table and len(table) > 1:
-                            df = pd.DataFrame(table[1:], columns=table[0])
-                            df = df.replace('', pd.NA).dropna(how='all')
-                            if not df.empty and len(df.columns) >= 2:
-                                all_tables.append(df)
-        except:
-            pass
+                    for page_num, page in enumerate(pdf.pages):
+                        page_data = {
+                            'page_num': page_num + 1,
+                            'text': page.extract_text() or '',
+                            'tables': []
+                        }
+                        
+                        # Lấy text
+                        if page_data['text']:
+                            result['text'].append(page_data['text'])
+                            
+                            # Tìm dòng có số liệu tài chính
+                            lines = page_data['text'].split('\n')
+                            for line in lines:
+                                if re.search(r'\d+[.,]\d+', line):
+                                    if any(k in line.lower() for k in ['doanh', 'lợi', 'chi', 'thu', 'năm', 'quý', 'revenue', 'profit', 'expense']):
+                                        result['financial_data'].append({
+                                            'page': page_num + 1,
+                                            'content': line
+                                        })
+                        
+                        # Lấy bảng
+                        tables = page.extract_tables()
+                        for table in tables:
+                            if table and len(table) > 1:
+                                try:
+                                    df = pd.DataFrame(table[1:], columns=table[0])
+                                    df = df.replace('', pd.NA).dropna(how='all')
+                                    if not df.empty and len(df.columns) >= 2:
+                                        result['tables'].append({
+                                            'page': page_num + 1,
+                                            'dataframe': df
+                                        })
+                                except:
+                                    pass
+                        
+                        result['pages'].append(page_data)
+                    
+                    result['success'] = True
+                    
+            except Exception as e:
+                result['error'] = f"pdfplumber error: {str(e)}"
+        
+        # Nếu pdfplumber thất bại, thử PyPDF2
+        if not result['success'] and PYPDF2_AVAILABLE:
+            try:
+                with open(tmp_path, 'rb') as file:
+                    reader = PyPDF2.PdfReader(file)
+                    result['total_pages'] = len(reader.pages)
+                    
+                    for page_num, page in enumerate(reader.pages):
+                        text = page.extract_text() or ''
+                        if text:
+                            result['text'].append(text)
+                            
+                            lines = text.split('\n')
+                            for line in lines:
+                                if re.search(r'\d+[.,]\d+', line):
+                                    result['financial_data'].append({
+                                        'page': page_num + 1,
+                                        'content': line
+                                    })
+                    
+                    result['success'] = True
+                    
+            except Exception as e:
+                result['error'] = f"PyPDF2 error: {str(e)}"
         
         # Dọn dẹp
         os.unlink(tmp_path)
         
-        if all_tables:
-            return all_tables
+        # Đánh giá kết quả
+        if result['success']:
+            if len(result['tables']) > 0:
+                result['message'] = f"✅ Tìm thấy {len(result['tables'])} bảng và {len(result['financial_data'])} dòng dữ liệu"
+            elif len(result['financial_data']) > 0:
+                result['message'] = f"✅ Tìm thấy {len(result['financial_data'])} dòng dữ liệu tài chính"
+            elif len(result['text']) > 0:
+                result['message'] = f"✅ Đọc được {len(result['text'])} trang text"
+            else:
+                result['message'] = "⚠️ Không tìm thấy dữ liệu trong PDF"
         else:
-            return None
-            
+            result['message'] = f"❌ Lỗi: {result['error']}"
+        
+        return result
+        
     except Exception as e:
-        st.error(f"Lỗi xử lý PDF: {str(e)}")
-        return None
+        return {
+            'success': False,
+            'error': str(e),
+            'message': f"❌ Lỗi xử lý PDF: {str(e)}",
+            'filename': pdf_file.name if pdf_file else 'unknown.pdf'
+        }
 
 def format_number(value):
     """Định dạng số đẹp"""
     try:
-        if pd.isna(value) or value == 'N/A':
+        if pd.isna(value) or value == 'N/A' or value is None:
             return 'N/A'
+        if isinstance(value, str):
+            value = value.replace(',', '').replace(' ', '')
         num = float(value)
         if abs(num) >= 1e9:
             return f"{num/1e9:.2f}B"
@@ -299,33 +398,37 @@ def format_number(value):
 
 # Xử lý loading state
 if st.session_state.get('loading', False):
-    with st.spinner("🔄 Đang xử lý dữ liệu..."):
-        time.sleep(1)
-        
-        # Xử lý theo nguồn
-        if data_source == "Yahoo Finance":
-            ticker = st.session_state.ticker
-            if ticker:
+    
+    # Xử lý theo nguồn
+    if data_source == "Yahoo Finance":
+        ticker = st.session_state.ticker
+        if ticker:
+            with st.spinner(f"🔄 Đang lấy dữ liệu {ticker}..."):
                 st.session_state.yf_data = fetch_yahoo_finance(ticker, years)
                 st.session_state.last_update = datetime.now().strftime("%H:%M:%S")
-        
-        elif data_source == "Upload PDF":
-            if 'uploaded_pdf' in st.session_state:
+    
+    elif data_source == "Upload PDF":
+        if st.session_state.uploaded_pdf is not None:
+            with st.spinner("🔄 Đang xử lý PDF..."):
                 st.session_state.pdf_data = extract_pdf_data(st.session_state.uploaded_pdf)
-        
-        else:  # Upload CSV/Excel
-            if 'uploaded_file' in st.session_state:
+                st.session_state.pdf_processed = True
+                st.session_state.last_update = datetime.now().strftime("%H:%M:%S")
+    
+    else:  # Upload CSV/Excel
+        if st.session_state.uploaded_file is not None:
+            with st.spinner("🔄 Đang đọc file..."):
                 try:
                     file = st.session_state.uploaded_file
                     if file.name.endswith('.csv'):
                         st.session_state.df_upload = pd.read_csv(file)
                     else:
                         st.session_state.df_upload = pd.read_excel(file)
+                    st.session_state.last_update = datetime.now().strftime("%H:%M:%S")
                 except Exception as e:
-                    st.error(f"Lỗi đọc file: {str(e)}")
-        
-        st.session_state.loading = False
-        st.rerun()
+                    st.error(f"❌ Lỗi đọc file: {str(e)}")
+    
+    st.session_state.loading = False
+    st.rerun()
 
 # HIỂN THỊ KẾT QUẢ
 st.divider()
@@ -340,8 +443,8 @@ if data_source == "Yahoo Finance":
             info = data.get('info', {})
             
             # Hiển thị thông tin công ty
-            company_name = info.get('longName', ticker)
-            st.subheader(f"🏢 {company_name}")
+            company_name = info.get('longName', info.get('shortName', ticker))
+            st.subheader(f"🏢 {company_name} ({ticker})")
             
             # Metrics
             col1, col2, col3, col4 = st.columns(4)
@@ -366,23 +469,23 @@ if data_source == "Yahoo Finance":
             with tab1:
                 financials = data.get('financials')
                 if financials is not None and not financials.empty:
-                    st.dataframe(financials.head(10), use_container_width=True)
+                    st.dataframe(financials, use_container_width=True)
                 else:
-                    st.info("Không có dữ liệu báo cáo KQKD")
+                    st.info("ℹ️ Không có dữ liệu báo cáo KQKD")
             
             with tab2:
                 cashflow = data.get('cashflow')
                 if cashflow is not None and not cashflow.empty:
-                    st.dataframe(cashflow.head(10), use_container_width=True)
+                    st.dataframe(cashflow, use_container_width=True)
                 else:
-                    st.info("Không có dữ liệu báo cáo dòng tiền")
+                    st.info("ℹ️ Không có dữ liệu báo cáo dòng tiền")
             
             with tab3:
                 balance = data.get('balance_sheet')
                 if balance is not None and not balance.empty:
-                    st.dataframe(balance.head(10), use_container_width=True)
+                    st.dataframe(balance, use_container_width=True)
                 else:
-                    st.info("Không có dữ liệu bảng CĐKT")
+                    st.info("ℹ️ Không có dữ liệu bảng CĐKT")
             
             with tab4:
                 history = data.get('history')
@@ -391,10 +494,10 @@ if data_source == "Yahoo Finance":
                     fig.update_layout(height=500)
                     st.plotly_chart(fig, use_container_width=True)
                     
-                    with st.expander("Xem dữ liệu chi tiết"):
+                    with st.expander("📋 Xem dữ liệu chi tiết"):
                         st.dataframe(history.tail(20), use_container_width=True)
                 else:
-                    st.info("Không có dữ liệu lịch sử giá")
+                    st.info("ℹ️ Không có dữ liệu lịch sử giá")
         
         else:
             error = data.get('error', '')
@@ -414,57 +517,82 @@ if data_source == "Yahoo Finance":
         
         # Hiển thị ví dụ
         with st.expander("📘 Mã cổ phiếu phổ biến"):
-            st.markdown("""
-            - **VN**: VNM, FPT, MSN, HPG, VIC, VCB, BID
-            - **US**: AAPL, MSFT, GOOGL, AMZN, TSLA
-            - **World**: BABA, TSM, SONY, NESN.SW
-            """)
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown("**Việt Nam:**\n- VNM\n- FPT\n- MSN\n- HPG\n- VIC")
+            with col2:
+                st.markdown("**Quốc tế:**\n- AAPL\n- MSFT\n- GOOGL\n- TSLA\n- BABA")
 
-# Case 2: PDF
+# Case 2: PDF - ĐÃ SỬA LỖI
 elif data_source == "Upload PDF":
-    if st.session_state.pdf_data:
-        st.subheader("📄 Dữ liệu từ PDF")
+    
+    # Hiển thị trạng thái
+    if st.session_state.pdf_processed and st.session_state.pdf_data:
+        data = st.session_state.pdf_data
         
-        pdf_data = st.session_state.pdf_data
+        # Hiển thị thông báo
+        if data.get('success'):
+            st.markdown(f"""
+            <div class="success-box">
+                {data.get('message', '✅ Xử lý PDF thành công!')}
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            st.markdown(f"""
+            <div class="warning-box">
+                {data.get('message', '⚠️ Có lỗi khi xử lý PDF')}
+            </div>
+            """, unsafe_allow_html=True)
         
-        for i, item in enumerate(pdf_data):
-            if isinstance(item, pd.DataFrame):
-                with st.expander(f"📊 Bảng {i+1}"):
-                    st.dataframe(item, use_container_width=True)
-            elif isinstance(item, str):
-                with st.expander(f"📝 Dòng {i+1}"):
-                    st.write(item)
-            else:
-                with st.expander(f"📄 Mục {i+1}"):
-                    st.write(item)
-    else:
-        st.info("👈 Upload file PDF và nhấn 'Xử lý PDF' để bắt đầu")
-
-# Case 3: CSV/Excel
-elif data_source == "Upload CSV/Excel":
-    if st.session_state.df_upload is not None:
-        st.subheader("📊 Dữ liệu từ file")
+        # Hiển thị tabs
+        if data.get('success'):
+            tab1, tab2, tab3 = st.tabs(["📊 Bảng dữ liệu", "📝 Dữ liệu tài chính", "📄 Text"])
+            
+            # Tab 1: Bảng dữ liệu
+            with tab1:
+                tables = data.get('tables', [])
+                if tables:
+                    for i, table in enumerate(tables):
+                        with st.expander(f"📊 Bảng {i+1} (Trang {table['page']})"):
+                            st.dataframe(table['dataframe'], use_container_width=True)
+                            
+                            # Nút tải xuống
+                            csv = table['dataframe'].to_csv(index=False).encode('utf-8')
+                            st.download_button(
+                                label=f"📥 Tải bảng {i+1}",
+                                data=csv,
+                                file_name=f"bang_{i+1}.csv",
+                                mime="text/csv"
+                            )
+                else:
+                    st.info("ℹ️ Không tìm thấy bảng dữ liệu trong PDF")
+            
+            # Tab 2: Dữ liệu tài chính
+            with tab2:
+                financial_data = data.get('financial_data', [])
+                if financial_data:
+                    df_fin = pd.DataFrame(financial_data)
+                    st.dataframe(df_fin, use_container_width=True)
+                else:
+                    st.info("ℹ️ Không tìm thấy dữ liệu tài chính")
+            
+            # Tab 3: Text
+            with tab3:
+                text_data = data.get('text', [])
+                if text_data:
+                    for i, text in enumerate(text_data):
+                        with st.expander(f"📄 Trang {i+1}"):
+                            st.text(text[:2000] + "..." if len(text) > 2000 else text)
+                else:
+                    st.info("ℹ️ Không có dữ liệu text")
         
-        df = st.session_state.df_upload
-        
-        # Hiển thị thông tin
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("Số dòng", len(df))
-        with col2:
-            st.metric("Số cột", len(df.columns))
-        with col3:
-            st.metric("Kiểu file", "CSV" if df is not None else "Excel")
-        
-        # Hiển thị dữ liệu
-        st.dataframe(df, use_container_width=True)
-        
-        # Thống kê
-        if st.checkbox("Hiển thị thống kê"):
-            st.dataframe(df.describe(), use_container_width=True)
-    else:
-        st.info("👈 Upload file và nhấn 'Đọc dữ liệu' để bắt đầu")
-
-# Footer
-st.divider()
-st.caption("© 2025 - Hệ thống tự động hóa báo cáo tài chính | Python 3.13 | Streamlit 1.54.0")
+        else:
+            st.error(f"❌ {data.get('error', 'Lỗi không xác định')}")
+            
+            # Hướng dẫn khắc phục
+            with st.expander("🔧 Hướng dẫn khắc phục"):
+                st.markdown("""
+                1. **Kiểm tra file PDF** có bị lỗi không
+                2. **Cài đặt thư viện** đầy đủ:
+                   ```bash
+                   pip install pdfplumber PyPDF2 --upgrade
